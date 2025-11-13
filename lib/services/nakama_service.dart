@@ -9,33 +9,32 @@ import 'package:nakama/nakama.dart';
 import 'package:nakama/src/api/proto/api/api.pb.dart' as api;
 import 'package:device_info_plus/device_info_plus.dart';
 
+import 'nakama_constants.dart';
+import 'nakama_exceptions.dart';
+import '../utils/logger.dart';
+
+/// Service for handling all Nakama-related operations including
+/// authentication, messaging, and image handling.
 class NakamaService {
   static final NakamaService _instance = NakamaService._internal();
   factory NakamaService() => _instance;
   NakamaService._internal();
 
+  final _logger = Logger('NakamaService');
+
+  // Nakama clients
   NakamaBaseClient? _client;
   NakamaWebsocketClient? _socketClient;
   Session? _session;
+
+  // User info
   String? _userId;
   String? _username;
 
-  String get host {
-    if (Platform.isAndroid) {
-      return '10.0.2.2'; // Android emulator special IP for host machine
-    } else if (Platform.isIOS) {
-      return '127.0.0.1'; // iOS simulator can use localhost
-    } else {
-      return '127.0.0.1'; // Default for other platforms
-    }
-  }
-
-  final int port = 7350;
-  final String serverKey = 'defaultkey';
-  final bool ssl = false;
-
+  // Channel info
   String? _channelId;
-  String? _channelName;
+
+  // Subscriptions
   StreamSubscription<ChannelMessage>? _messageSubscription;
   StreamSubscription<ChannelPresenceEvent>? _presenceSubscription;
 
@@ -46,49 +45,60 @@ class NakamaService {
   final _usersStreamController =
       StreamController<List<Map<String, String>>>.broadcast();
 
-  /// Stream of users list updates
+  // Getters
   Stream<List<Map<String, String>>> get usersStream =>
       _usersStreamController.stream;
-
   NakamaBaseClient? get client => _client;
   Session? get session => _session;
   String? get userId => _userId;
   String? get username => _username;
   String? get channelId => _channelId;
 
+  /// Get the appropriate host based on the platform
+  String get host {
+    if (Platform.isAndroid) {
+      return '10.0.2.2'; // Android emulator special IP for host machine
+    } else if (Platform.isIOS) {
+      return '127.0.0.1'; // iOS simulator can use localhost
+    } else {
+      return '127.0.0.1'; // Default for other platforms
+    }
+  }
+
   /// Initialize Nakama client
   Future<void> initialize() async {
-    print('Initializing Nakama client with host: $host, port: $port');
+    _logger.info('Initializing Nakama client with host: $host');
     _client = getNakamaClient(
       host: host,
-      ssl: ssl,
-      serverKey: serverKey,
-      httpPort: port,
-      grpcPort: 7349,
+      ssl: NakamaConstants.useSSL,
+      serverKey: NakamaConstants.serverKey,
+      httpPort: NakamaConstants.httpPort,
+      grpcPort: NakamaConstants.grpcPort,
     );
-    print('Nakama client initialized');
+    _logger.success('Nakama client initialized');
   }
 
   /// Initialize WebSocket client
   Future<void> _initializeSocket() async {
     if (_session == null) {
-      throw Exception('Not authenticated');
+      throw NotAuthenticatedException();
     }
 
-    print('Initializing WebSocket client with host: $host, port: 7350');
+    _logger.info('Initializing WebSocket client');
     _socketClient = NakamaWebsocketClient.init(
       host: host,
-      ssl: ssl,
-      port: 7350,
+      ssl: NakamaConstants.useSSL,
+      port: NakamaConstants.wsPort,
       token: _session!.token,
       onError: (error) {
-        print('WebSocket error: $error');
+        _logger.error('WebSocket error', error);
       },
     );
-    print('WebSocket client initialized');
+    _logger.success('WebSocket client initialized');
   }
 
-  Future<String> _getDeviceId(String username) async {
+  /// Generate a unique device ID for authentication
+  Future<String> _generateDeviceId(String username) async {
     try {
       final deviceInfo = DeviceInfoPlugin();
       String? emulatorSerial;
@@ -96,9 +106,8 @@ class NakamaService {
 
       if (Platform.isAndroid) {
         final androidInfo = await deviceInfo.androidInfo;
-        // Use serial number (unique per emulator) or Android ID as base
         emulatorSerial = androidInfo.serialNumber;
-        deviceBaseId = androidInfo.id; // Android ID
+        deviceBaseId = androidInfo.id;
       } else if (Platform.isIOS) {
         final iosInfo = await deviceInfo.iosInfo;
         deviceBaseId = iosInfo.identifierForVendor ??
@@ -107,147 +116,150 @@ class NakamaService {
         deviceBaseId = 'device-${DateTime.now().millisecondsSinceEpoch}';
       }
 
-      // Generate a unique UUID-like string for this session
-      final random = Random();
-      final timestamp = DateTime.now().millisecondsSinceEpoch;
-      final randomPart1 = random.nextInt(999999).toString().padLeft(6, '0');
-      final randomPart2 = random.nextInt(999999).toString().padLeft(6, '0');
-
-      // Create device ID: username + emulatorSerial (if available) + timestamp + random
-      // This ensures each login creates a unique user
-      String deviceId;
-      if (emulatorSerial != null &&
-          emulatorSerial.isNotEmpty &&
-          emulatorSerial != 'unknown') {
-        // Include emulator serial for uniqueness across emulators
-        deviceId =
-            '${username}_${emulatorSerial}_${timestamp}_${randomPart1}_${randomPart2}';
-      } else {
-        // Fallback: use device base ID + timestamp + random
-        deviceId =
-            '${username}_${deviceBaseId}_${timestamp}_${randomPart1}_${randomPart2}';
-      }
-
-      // Ensure device ID is at least 10 bytes
-      if (deviceId.length < 10) {
-        deviceId = 'user-${deviceId}'.substring(0, 10);
-      }
-
-      // Truncate if too long (max 128 bytes)
-      if (deviceId.length > 128) {
-        deviceId = deviceId.substring(0, 128);
-      }
-
-      print('Generated device ID: $deviceId (length: ${deviceId.length})');
-      if (emulatorSerial != null) {
-        print('Emulator serial: $emulatorSerial');
-      }
+      final deviceId = _buildDeviceId(username, emulatorSerial, deviceBaseId);
+      _logger
+          .debug('Generated device ID: $deviceId (length: ${deviceId.length})');
 
       return deviceId;
     } catch (e) {
-      print('Error generating device ID: $e');
-      // Fallback: use username + timestamp + random to ensure unique ID
-      final random = Random();
-      final timestamp = DateTime.now().millisecondsSinceEpoch;
-      final randomPart1 = random.nextInt(999999).toString().padLeft(6, '0');
-      final randomPart2 = random.nextInt(999999).toString().padLeft(6, '0');
-      final fallbackId =
-          '${username}_${timestamp}_${randomPart1}_${randomPart2}';
-
-      print('Using fallback device ID: $fallbackId');
-
-      if (fallbackId.length < 10) {
-        return 'user-${fallbackId}'.substring(0, 10);
-      }
-      return fallbackId.length > 128
-          ? fallbackId.substring(0, 128)
-          : fallbackId;
+      _logger.warning('Error generating device ID, using fallback: $e');
+      return _buildFallbackDeviceId(username);
     }
   }
 
-  /// Authenticate with Nakama (using device ID as username)
+  /// Build device ID from components
+  String _buildDeviceId(
+    String username,
+    String? emulatorSerial,
+    String deviceBaseId,
+  ) {
+    final random = Random();
+    final timestamp = DateTime.now().millisecondsSinceEpoch;
+    final randomPart1 = random.nextInt(999999).toString().padLeft(6, '0');
+    final randomPart2 = random.nextInt(999999).toString().padLeft(6, '0');
+
+    String deviceId;
+    if (emulatorSerial != null &&
+        emulatorSerial.isNotEmpty &&
+        emulatorSerial != 'unknown') {
+      deviceId =
+          '${username}_${emulatorSerial}_${timestamp}_${randomPart1}_${randomPart2}';
+    } else {
+      deviceId =
+          '${username}_${deviceBaseId}_${timestamp}_${randomPart1}_${randomPart2}';
+    }
+
+    return _normalizeDeviceId(deviceId);
+  }
+
+  /// Build fallback device ID
+  String _buildFallbackDeviceId(String username) {
+    final random = Random();
+    final timestamp = DateTime.now().millisecondsSinceEpoch;
+    final randomPart1 = random.nextInt(999999).toString().padLeft(6, '0');
+    final randomPart2 = random.nextInt(999999).toString().padLeft(6, '0');
+    final fallbackId = '${username}_${timestamp}_${randomPart1}_${randomPart2}';
+
+    return _normalizeDeviceId(fallbackId);
+  }
+
+  /// Normalize device ID to meet length constraints
+  String _normalizeDeviceId(String deviceId) {
+    if (deviceId.length < NakamaConstants.minDeviceIdLength) {
+      deviceId =
+          'user-$deviceId'.substring(0, NakamaConstants.minDeviceIdLength);
+    }
+    if (deviceId.length > NakamaConstants.maxDeviceIdLength) {
+      deviceId = deviceId.substring(0, NakamaConstants.maxDeviceIdLength);
+    }
+    return deviceId;
+  }
+
+  /// Clear existing session and connections
+  Future<void> _clearSession() async {
+    if (_session == null) return;
+
+    _logger.debug('Clearing existing session');
+    try {
+      await _socketClient?.close();
+    } catch (e) {
+      _logger.warning('Error closing socket: $e');
+    }
+
+    _socketClient = null;
+    _session = null;
+    _userId = null;
+    _username = null;
+    _users.clear();
+  }
+
+  /// Authenticate with Nakama using device ID
   Future<bool> authenticate(String username) async {
     try {
-      // Clear any existing session first to ensure fresh authentication
-      if (_session != null) {
-        print('Clearing existing session before re-authentication');
-        try {
-          if (_socketClient != null) {
-            await _socketClient!.close();
-          }
-        } catch (e) {
-          print('Error closing socket: $e');
-        }
-        _socketClient = null;
-        _session = null;
-        _userId = null;
-        _username = null;
-        _users.clear();
-      }
+      await _clearSession();
 
       if (_client == null) {
         await initialize();
       }
 
-      print('Attempting to authenticate with host: $host, port: $port');
-      print('Username: $username');
+      _logger.info('Authenticating user: $username');
+      final deviceId = await _generateDeviceId(username);
 
-      // Get valid device ID (10-128 bytes) - unique for each login session
-      final deviceId = await _getDeviceId(username);
-      print('Using device ID: $deviceId (length: ${deviceId.length})');
-
-      // Authenticate with device ID
-      // Note: create: true will create a new user if device ID doesn't exist
-      // Since we use unique device IDs, each login creates a new user
-      // We don't pass username here to avoid ALREADY_EXISTS error
-      // Username will be set via account update after authentication
-      try {
-        _session = await _client!.authenticateDevice(
-          deviceId: deviceId,
-          username: null, // Don't set username here to avoid conflicts
-          create: true,
-        );
-      } catch (e) {
-        // If user already exists with this device ID, try to authenticate without create
-        print('First authentication attempt failed: $e');
-        print('Trying to authenticate with existing device ID...');
-        _session = await _client!.authenticateDevice(
-          deviceId: deviceId,
-          username: null,
-          create: false,
-        );
-      }
-
+      // Attempt authentication
+      _session = await _authenticateWithDeviceId(deviceId);
       _userId = _session!.userId;
       _username = username;
 
-      // Update account display name (not username to avoid conflicts)
-      // Username in Nakama must be unique, but display name can be duplicated
-      try {
-        await _client!.updateAccount(
-          session: _session!,
-          displayName: username, // Use displayName instead of username
-        );
-        print('Display name updated successfully: $username');
-      } catch (e) {
-        print('Warning: Could not update display name: $e');
-        // Continue anyway - user is authenticated even if display name update fails
-      }
+      // Update display name
+      await _updateDisplayName(username);
 
-      print('Authentication successful!');
-      print('  User ID: $_userId');
-      print('  Username: $_username');
-      print('  Device ID: $deviceId');
+      _logger.success('Authentication successful');
+      _logger.debug('User ID: $_userId');
+      _logger.debug('Username: $_username');
 
       // Initialize socket client after authentication
       await _initializeSocket();
 
       return true;
     } catch (e, stackTrace) {
-      print('Authentication error: $e');
-      print('Stack trace: $stackTrace');
-      print('Host used: $host, Port: $port');
-      return false;
+      _logger.error('Authentication failed', e, stackTrace);
+      throw AuthenticationFailedException(
+        'Failed to authenticate user: $username',
+        error: e,
+        stackTrace: stackTrace,
+      );
+    }
+  }
+
+  /// Authenticate with device ID, with retry logic
+  Future<Session> _authenticateWithDeviceId(String deviceId) async {
+    try {
+      return await _client!.authenticateDevice(
+        deviceId: deviceId,
+        username: null,
+        create: true,
+      );
+    } catch (e) {
+      _logger.debug(
+          'First authentication attempt failed, retrying without create flag');
+      return await _client!.authenticateDevice(
+        deviceId: deviceId,
+        username: null,
+        create: false,
+      );
+    }
+  }
+
+  /// Update account display name
+  Future<void> _updateDisplayName(String displayName) async {
+    try {
+      await _client!.updateAccount(
+        session: _session!,
+        displayName: displayName,
+      );
+      _logger.success('Display name updated: $displayName');
+    } catch (e) {
+      _logger.warning('Could not update display name: $e');
     }
   }
 
@@ -258,7 +270,8 @@ class NakamaService {
         await _initializeSocket();
       }
 
-      // Join a chat channel
+      _logger.info('Joining channel: $channelName');
+
       final channel = await _socketClient!.joinChannel(
         target: channelName,
         type: ChannelType.room,
@@ -267,84 +280,92 @@ class NakamaService {
       );
 
       _channelId = channel.id;
-      _channelName = channelName; // Store channel name
 
-      print('Joined channel: $channelName (ID: ${channel.id})');
-      print('Current user ID: $_userId');
-      print('Current username: $_username');
-      print('Initial presences count: ${channel.presences.length}');
+      _logger.success('Joined channel: $channelName (ID: ${channel.id})');
+      _logger.debug('Initial presences count: ${channel.presences.length}');
 
-      // Track users from channel presence
-      if (channel.presences.isNotEmpty) {
-        print('Processing initial presences:');
-        for (final presence in channel.presences) {
-          print('  - User: ${presence.username} (${presence.userId})');
-          // Don't add current user to the list
-          if (presence.userId != _userId) {
-            _users[presence.userId] = presence.username;
-            print('    Added to users list');
-          } else {
-            print('    Skipped (current user)');
-          }
-        }
-      } else {
-        print('No initial presences in channel');
-      }
-
-      // Cancel previous subscription if exists
-      await _presenceSubscription?.cancel();
+      // Track initial users
+      _processInitialPresences(channel.presences);
 
       // Listen to presence events
-      _presenceSubscription = _socketClient!.onChannelPresence.listen((event) {
-        print('Presence event received:');
-        print('  Channel ID: ${event.channelId}');
-        print('  Joins: ${event.joins?.length ?? 0}');
-        print('  Leaves: ${event.leaves?.length ?? 0}');
-
-        bool updated = false;
-
-        if (event.joins != null && event.joins!.isNotEmpty) {
-          print('Processing joins:');
-          for (final presence in event.joins!) {
-            print('  - User joined: ${presence.username} (${presence.userId})');
-            // Don't add current user to the list
-            if (presence.userId != _userId) {
-              _users[presence.userId] = presence.username;
-              updated = true;
-              print('    Added to users list');
-            } else {
-              print('    Skipped (current user)');
-            }
-          }
-        }
-        if (event.leaves != null && event.leaves!.isNotEmpty) {
-          print('Processing leaves:');
-          for (final presence in event.leaves!) {
-            print('  - User left: ${presence.username} (${presence.userId})');
-            _users.remove(presence.userId);
-            updated = true;
-            print('    Removed from users list');
-          }
-        }
-
-        // Notify listeners if users list changed
-        if (updated) {
-          print('Users list updated, notifying listeners...');
-          _notifyUsersUpdated();
-        } else {
-          print('No changes to users list');
-        }
-      });
+      _subscribeToPresenceEvents();
 
       // Notify initial users list
-      print('Notifying initial users list...');
       _notifyUsersUpdated();
 
       return true;
-    } catch (e) {
-      print('Join channel error: $e');
-      return false;
+    } catch (e, stackTrace) {
+      _logger.error('Failed to join channel: $channelName', e, stackTrace);
+      throw ChannelException(
+        'Failed to join channel: $channelName',
+        error: e,
+        stackTrace: stackTrace,
+      );
     }
+  }
+
+  /// Process initial presences when joining a channel
+  void _processInitialPresences(List<UserPresence> presences) {
+    if (presences.isEmpty) {
+      _logger.debug('No initial presences in channel');
+      return;
+    }
+
+    _logger.debug('Processing initial presences:');
+    for (final presence in presences) {
+      _logger.debug('  - User: ${presence.username} (${presence.userId})');
+      if (presence.userId != _userId) {
+        _users[presence.userId] = presence.username;
+      }
+    }
+  }
+
+  /// Subscribe to presence events
+  void _subscribeToPresenceEvents() {
+    _presenceSubscription?.cancel();
+    _presenceSubscription = _socketClient!.onChannelPresence.listen((event) {
+      _logger.debug('Presence event received');
+      _logger.debug('  Joins: ${event.joins?.length ?? 0}');
+      _logger.debug('  Leaves: ${event.leaves?.length ?? 0}');
+
+      bool updated = false;
+
+      if (event.joins != null && event.joins!.isNotEmpty) {
+        updated = _processJoins(event.joins!.toList()) || updated;
+      }
+      if (event.leaves != null && event.leaves!.isNotEmpty) {
+        updated = _processLeaves(event.leaves!.toList()) || updated;
+      }
+
+      if (updated) {
+        _notifyUsersUpdated();
+      }
+    });
+  }
+
+  /// Process user joins
+  bool _processJoins(List<UserPresence> joins) {
+    bool updated = false;
+    for (final presence in joins) {
+      _logger
+          .debug('  - User joined: ${presence.username} (${presence.userId})');
+      if (presence.userId != _userId) {
+        _users[presence.userId] = presence.username;
+        updated = true;
+      }
+    }
+    return updated;
+  }
+
+  /// Process user leaves
+  bool _processLeaves(List<UserPresence> leaves) {
+    bool updated = false;
+    for (final presence in leaves) {
+      _logger.debug('  - User left: ${presence.username} (${presence.userId})');
+      _users.remove(presence.userId);
+      updated = true;
+    }
+    return updated;
   }
 
   /// Join or create a direct message channel with another user
@@ -354,7 +375,8 @@ class NakamaService {
         await _initializeSocket();
       }
 
-      // Join a direct message channel
+      _logger.info('Joining direct message with user: $targetUserId');
+
       final channel = await _socketClient!.joinChannel(
         target: targetUserId,
         type: ChannelType.directMessage,
@@ -363,17 +385,23 @@ class NakamaService {
       );
 
       _channelId = channel.id;
-      _channelName = null; // Direct messages don't have a name
+
+      _logger.success('Joined direct message channel');
       return true;
-    } catch (e) {
-      print('Join direct message error: $e');
-      return false;
+    } catch (e, stackTrace) {
+      _logger.error('Failed to join direct message', e, stackTrace);
+      throw ChannelException(
+        'Failed to join direct message',
+        error: e,
+        stackTrace: stackTrace,
+      );
     }
   }
 
-  /// Get list of users (from tracked users)
+  /// Get list of users (excluding current user)
   List<Map<String, String>> getUsers() {
     return _users.entries
+        .where((entry) => entry.key != _userId)
         .map((entry) => {
               'id': entry.key,
               'username': entry.value,
@@ -384,18 +412,15 @@ class NakamaService {
   /// Notify listeners that users list has been updated
   void _notifyUsersUpdated() {
     final usersList = getUsers();
-    // Filter out current user
-    final filteredUsers =
-        usersList.where((user) => user['id'] != _userId).toList();
-    _usersStreamController.add(filteredUsers);
-    print('Users list updated: ${filteredUsers.length} users');
+    _usersStreamController.add(usersList);
+    _logger.debug('Users list updated: ${usersList.length} users');
   }
 
   /// Get user info by ID
   Future<Map<String, String>?> getUserInfo(String userId) async {
     try {
       if (_client == null || _session == null) {
-        return null;
+        throw NotAuthenticatedException();
       }
 
       final users = await _client!.getUsers(
@@ -412,7 +437,7 @@ class NakamaService {
 
       return null;
     } catch (e) {
-      print('Get user info error: $e');
+      _logger.error('Failed to get user info', e);
       return null;
     }
   }
@@ -421,7 +446,7 @@ class NakamaService {
   Future<bool> sendTextMessage(String message) async {
     try {
       if (_socketClient == null || _channelId == null) {
-        throw Exception('Not connected to channel');
+        throw NotConnectedToChannelException();
       }
 
       await _socketClient!.sendMessage(
@@ -434,7 +459,7 @@ class NakamaService {
 
       return true;
     } catch (e) {
-      print('Send message error: $e');
+      _logger.error('Failed to send text message', e);
       return false;
     }
   }
@@ -442,138 +467,151 @@ class NakamaService {
   /// Upload image to Minio via Nakama RPC and send as message
   Future<bool> sendImageMessage(File imageFile) async {
     try {
-      if (_client == null ||
-          _session == null ||
-          _socketClient == null ||
-          _channelId == null) {
-        print('Send image error: Not connected to channel');
-        throw Exception('Not connected to channel');
-      }
+      _validateConnections();
 
-      print('Reading image file: ${imageFile.path}');
+      _logger.info('Sending image: ${imageFile.path}');
 
-      // Read image file as bytes
+      // Read and validate image
       final imageBytes = await imageFile.readAsBytes();
-      print('Image size: ${imageBytes.length} bytes');
+      _validateImageSize(imageBytes.length);
 
-      // Check if image is too large
-      if (imageBytes.length > 5 * 1024 * 1024) {
-        // 5MB limit
-        print('Image too large: ${imageBytes.length} bytes');
-        throw Exception('Image too large. Maximum size is 5MB.');
-      }
+      // Upload image
+      final uploadResult = await _uploadImage(imageFile, imageBytes);
 
-      // Encode to base64
-      final base64Image = base64Encode(imageBytes);
-      print('Base64 encoded size: ${base64Image.length} bytes');
-
-      // Determine content type from file extension
-      final extension = imageFile.path.split('.').last.toLowerCase();
-      String contentType;
-      switch (extension) {
-        case 'jpg':
-        case 'jpeg':
-          contentType = 'image/jpeg';
-          break;
-        case 'png':
-          contentType = 'image/png';
-          break;
-        case 'gif':
-          contentType = 'image/gif';
-          break;
-        case 'webp':
-          contentType = 'image/webp';
-          break;
-        default:
-          contentType = 'image/jpeg';
-      }
-
-      // Prepare RPC request payload
-      final rpcPayload = jsonEncode({
-        'imageData': base64Image,
-        'contentType': contentType,
-        'fileName': imageFile.path.split('/').last,
-      });
-
-      print('Calling RPC upload_image...');
-
-      // Call Nakama RPC to upload image to Minio
-      final rpcResponse = await _client!.rpc(
-        session: _session!,
-        id: 'upload_image',
-        payload: rpcPayload,
+      // Send message
+      await _sendImageMessageToChannel(
+        uploadResult['imageUrl'] as String,
+        uploadResult['objectKey'] as String,
       );
 
-      print('RPC response: $rpcResponse');
-
-      // Parse response (rpcResponse is already a String)
-      if (rpcResponse == null) {
-        throw Exception('RPC response is null');
-      }
-      final responseData = jsonDecode(rpcResponse);
-
-      if (responseData['success'] != true) {
-        throw Exception(
-            'Image upload failed: ${responseData['error'] ?? 'Unknown error'}');
-      }
-
-      final imageUrl = responseData['imageUrl'] as String;
-      final objectKey = responseData['objectKey'] as String;
-
-      print('Image uploaded successfully: $objectKey');
-      print('Image URL: $imageUrl');
-
-      // Send message with image URL
-      try {
-        await _socketClient!.sendMessage(
-          channelId: _channelId!,
-          content: {
-            'type': 'image',
-            'imageUrl': imageUrl,
-            'objectKey': objectKey,
-            'timestamp': DateTime.now().toIso8601String(),
-          },
-        );
-        print('Image message sent successfully');
-      } catch (messageError) {
-        print('Message send error: $messageError');
-        print('Message error stack trace: ${StackTrace.current}');
-        rethrow;
-      }
-
+      _logger.success('Image message sent successfully');
       return true;
     } catch (e, stackTrace) {
-      print('Send image error: $e');
-      print('Stack trace: $stackTrace');
-      return false;
+      _logger.error('Failed to send image message', e, stackTrace);
+      if (e is NakamaException) rethrow;
+      throw ImageUploadException(
+        'Failed to send image message',
+        error: e,
+        stackTrace: stackTrace,
+      );
     }
   }
 
+  /// Validate that all required connections are established
+  void _validateConnections() {
+    if (_client == null || _session == null) {
+      throw NotAuthenticatedException();
+    }
+    if (_socketClient == null || _channelId == null) {
+      throw NotConnectedToChannelException();
+    }
+  }
+
+  /// Validate image size
+  void _validateImageSize(int size) {
+    _logger.debug('Image size: $size bytes');
+    if (size > NakamaConstants.maxImageSizeBytes) {
+      throw ImageTooLargeException(size, NakamaConstants.maxImageSizeBytes);
+    }
+  }
+
+  /// Upload image to storage
+  Future<Map<String, String>> _uploadImage(
+      File imageFile, Uint8List imageBytes) async {
+    final base64Image = base64Encode(imageBytes);
+    final contentType = _getContentType(imageFile.path);
+    final fileName = imageFile.path.split('/').last;
+
+    final rpcPayload = jsonEncode({
+      'imageData': base64Image,
+      'contentType': contentType,
+      'fileName': fileName,
+    });
+
+    _logger.debug('Calling RPC upload_image...');
+
+    final rpcResponse = await _client!.rpc(
+      session: _session!,
+      id: 'upload_image',
+      payload: rpcPayload,
+    );
+
+    return _parseUploadResponse(rpcResponse);
+  }
+
+  /// Get content type from file path
+  String _getContentType(String filePath) {
+    final extension = filePath.split('.').last.toLowerCase();
+    switch (extension) {
+      case 'jpg':
+      case 'jpeg':
+        return 'image/jpeg';
+      case 'png':
+        return 'image/png';
+      case 'gif':
+        return 'image/gif';
+      case 'webp':
+        return 'image/webp';
+      default:
+        return 'image/jpeg';
+    }
+  }
+
+  /// Parse upload response
+  Map<String, String> _parseUploadResponse(String? rpcResponse) {
+    if (rpcResponse == null) {
+      throw ImageUploadException('RPC response is null');
+    }
+
+    final responseData = jsonDecode(rpcResponse);
+    if (responseData['success'] != true) {
+      throw ImageUploadException(
+        'Image upload failed: ${responseData['error'] ?? 'Unknown error'}',
+      );
+    }
+
+    final imageUrl = responseData['imageUrl'] as String;
+    final objectKey = responseData['objectKey'] as String;
+
+    _logger.success('Image uploaded: $objectKey');
+    _logger.debug('Image URL: $imageUrl');
+
+    return {
+      'imageUrl': imageUrl,
+      'objectKey': objectKey,
+    };
+  }
+
+  /// Send image message to channel
+  Future<void> _sendImageMessageToChannel(
+      String imageUrl, String objectKey) async {
+    await _socketClient!.sendMessage(
+      channelId: _channelId!,
+      content: {
+        'type': 'image',
+        'imageUrl': imageUrl,
+        'objectKey': objectKey,
+        'timestamp': DateTime.now().toIso8601String(),
+      },
+    );
+  }
+
   /// Fetch channel message history from Nakama server
-  /// Returns a map containing 'messages' and 'nextCursor' for pagination
   Future<Map<String, dynamic>> fetchChannelHistory({
-    int limit = 100,
+    int limit = NakamaConstants.defaultMessageLimit,
     bool forward = true,
     String? cursor,
   }) async {
     try {
       if (_client == null || _session == null) {
-        print('Fetch history error: Not authenticated');
-        throw Exception('Not authenticated');
+        throw NotAuthenticatedException();
       }
-
       if (_channelId == null) {
-        print('Fetch history error: No channel joined');
-        throw Exception('No channel joined');
+        throw NotConnectedToChannelException('No channel joined');
       }
 
-      print('Fetching channel history from server...');
-      print('Channel ID: $_channelId');
-      print('Limit: $limit');
-      print('Cursor: $cursor');
-      print('Forward: $forward');
+      _logger.info('Fetching channel history (limit: $limit, cursor: $cursor)');
 
-      // Call Nakama API to list channel messages
       final result = await _client!.listChannelMessages(
         session: _session!,
         channelId: _channelId!,
@@ -582,24 +620,16 @@ class NakamaService {
         cursor: cursor,
       );
 
-      print('Fetched ${result.messages?.length ?? 0} messages from server');
-      print('Next cursor: ${result.nextCursor}');
-      print('Prev cursor: ${result.prevCursor}');
-
-      // Convert api.ChannelMessageList to List<api.ChannelMessage>
-      final messages =
-          result.messages?.map((msg) => msg as api.ChannelMessage).toList() ??
-              [];
+      _logger.success('Fetched ${result.messages?.length ?? 0} messages');
 
       return {
-        'messages': messages,
+        'messages': result.messages ?? [],
         'nextCursor': result.nextCursor,
         'prevCursor': result.prevCursor,
         'cacheableCursor': result.cacheableCursor,
       };
     } catch (e, stackTrace) {
-      print('Fetch channel history error: $e');
-      print('Stack trace: $stackTrace');
+      _logger.error('Failed to fetch channel history', e, stackTrace);
       rethrow;
     }
   }
@@ -607,54 +637,44 @@ class NakamaService {
   /// Listen to chat messages
   Stream<api.ChannelMessage> listenToMessages() {
     if (_socketClient == null || _channelId == null) {
-      throw Exception('Not connected to channel');
+      throw NotConnectedToChannelException();
     }
-
     return _socketClient!.onChannelMessage;
   }
 
-  /// Get image URL from Minio via Nakama RPC
+  /// Get image URL from storage via Nakama RPC
   Future<String?> getImageUrl(String objectKey) async {
     try {
       if (_client == null || _session == null) {
-        print('Get image URL error: Not authenticated');
-        throw Exception('Not authenticated');
+        throw NotAuthenticatedException();
       }
 
-      print('Getting image URL for object key: $objectKey');
+      _logger.debug('Getting image URL for: $objectKey');
 
-      // Prepare RPC request payload
-      final rpcPayload = jsonEncode({
-        'objectKey': objectKey,
-      });
-
-      // Call Nakama RPC to get presigned URL
+      final rpcPayload = jsonEncode({'objectKey': objectKey});
       final rpcResponse = await _client!.rpc(
         session: _session!,
         id: 'get_image_url',
         payload: rpcPayload,
       );
 
-      print('RPC response: $rpcResponse');
-
-      // Parse response (rpcResponse is already a String)
       if (rpcResponse == null) {
-        throw Exception('RPC response is null');
+        throw ImageDownloadException('RPC response is null');
       }
-      final responseData = jsonDecode(rpcResponse);
 
+      final responseData = jsonDecode(rpcResponse);
       if (responseData['success'] != true) {
-        throw Exception(
-            'Get image URL failed: ${responseData['error'] ?? 'Unknown error'}');
+        throw ImageDownloadException(
+          'Get image URL failed: ${responseData['error'] ?? 'Unknown error'}',
+        );
       }
 
       final imageUrl = responseData['imageUrl'] as String;
-      print('Image URL retrieved: $imageUrl');
+      _logger.debug('Image URL retrieved: $imageUrl');
 
       return imageUrl;
     } catch (e, stackTrace) {
-      print('Get image URL error: $e');
-      print('Stack trace: $stackTrace');
+      _logger.error('Failed to get image URL', e, stackTrace);
       return null;
     }
   }
@@ -662,82 +682,76 @@ class NakamaService {
   /// Download image from URL
   Future<Uint8List?> downloadImageFromUrl(String imageUrl) async {
     try {
-      print('Downloading image from URL: $imageUrl');
+      _logger.debug('Downloading image from: $imageUrl');
 
-      final originalUri = Uri.parse(imageUrl);
-      Uri requestUri = originalUri;
-      String? hostHeader;
+      final requestUri = _adjustUriForPlatform(imageUrl);
+      final bytes = await _performImageDownload(requestUri);
 
-      // Map internal container hostnames to an address reachable from the device/emulator.
-      final internalHosts = {'nakama-minio', 'minio', 'localhost', '127.0.0.1'};
-      if (internalHosts.contains(originalUri.host)) {
-        String mappedHost = originalUri.host;
-
-        if (!kIsWeb) {
-          if (Platform.isAndroid) {
-            // Android emulator forwards host machine through 10.0.2.2
-            mappedHost = '10.0.2.2';
-          } else if (Platform.isIOS) {
-            // iOS simulator can reach host via localhost
-            mappedHost = '127.0.0.1';
-          } else if (Platform.isMacOS ||
-              Platform.isWindows ||
-              Platform.isLinux) {
-            mappedHost = '127.0.0.1';
-          }
-        }
-
-        requestUri = originalUri.replace(host: mappedHost);
-        hostHeader = originalUri.hasPort
-            ? '${originalUri.host}:${originalUri.port}'
-            : originalUri.host;
-        print(
-            'Adjusted image URL for client: $requestUri (Host header: $hostHeader)');
-      }
-
-      final client = HttpClient();
-      client.connectionTimeout = const Duration(seconds: 10);
-
-      final request = await client.getUrl(requestUri);
-      if (hostHeader != null) {
-        request.headers.set(HttpHeaders.hostHeader, hostHeader);
-      }
-
-      final response = await request.close().timeout(
-        const Duration(seconds: 30),
-        onTimeout: () {
-          throw TimeoutException('Image download timed out');
-        },
-      );
-
-      if (response.statusCode != 200) {
-        print('Failed to download image: ${response.statusCode}');
-        return null;
-      }
-
-      final bytes = await consolidateHttpClientResponseBytes(response);
-      print('Image downloaded successfully, size: ${bytes.length} bytes');
-
+      _logger.success('Image downloaded (${bytes.length} bytes)');
       return bytes;
     } catch (e, stackTrace) {
-      print('Download image error: $e');
-      print('Stack trace: $stackTrace');
+      _logger.error('Failed to download image', e, stackTrace);
       return null;
     }
   }
 
-  /// Get stored image (deprecated - use getImageUrl and downloadImageFromUrl instead)
-  @Deprecated('Use getImageUrl and downloadImageFromUrl instead')
-  Future<Uint8List?> getStoredImage(String imageId) async {
-    // This method is kept for backward compatibility
-    // but now uses the new URL-based approach
-    final imageUrl = await getImageUrl(imageId);
-    if (imageUrl == null) return null;
-    return downloadImageFromUrl(imageUrl);
+  /// Adjust URI for platform-specific networking
+  Uri _adjustUriForPlatform(String imageUrl) {
+    final originalUri = Uri.parse(imageUrl);
+
+    if (!NakamaConstants.internalHosts.contains(originalUri.host)) {
+      return originalUri;
+    }
+
+    String mappedHost = _getMappedHost(originalUri.host);
+    final requestUri = originalUri.replace(host: mappedHost);
+
+    _logger.debug('Adjusted URL for platform: $requestUri');
+    return requestUri;
+  }
+
+  /// Get mapped host for platform
+  String _getMappedHost(String originalHost) {
+    if (kIsWeb) return originalHost;
+
+    if (Platform.isAndroid) {
+      return '10.0.2.2'; // Android emulator
+    } else if (Platform.isIOS ||
+        Platform.isMacOS ||
+        Platform.isWindows ||
+        Platform.isLinux) {
+      return '127.0.0.1';
+    }
+
+    return originalHost;
+  }
+
+  /// Perform image download with timeout
+  Future<Uint8List> _performImageDownload(Uri uri) async {
+    final client = HttpClient();
+    client.connectionTimeout = NakamaConstants.connectionTimeout;
+
+    final request = await client.getUrl(uri);
+    final response = await request.close().timeout(
+      NakamaConstants.downloadTimeout,
+      onTimeout: () {
+        throw TimeoutException('Image download timed out');
+      },
+    );
+
+    if (response.statusCode != 200) {
+      throw ImageDownloadException(
+        'Failed to download image: ${response.statusCode}',
+      );
+    }
+
+    return await consolidateHttpClientResponseBytes(response);
   }
 
   /// Disconnect from Nakama
   Future<void> disconnect() async {
+    _logger.info('Disconnecting from Nakama');
+
     await _messageSubscription?.cancel();
     _messageSubscription = null;
     await _presenceSubscription?.cancel();
@@ -745,20 +759,20 @@ class NakamaService {
 
     if (_channelId != null && _socketClient != null) {
       try {
-        await _socketClient!.leaveChannel(
-          channelId: _channelId!,
-        );
+        await _socketClient!.leaveChannel(channelId: _channelId!);
       } catch (e) {
-        print('Leave channel error: $e');
+        _logger.warning('Error leaving channel: $e');
       }
     }
+
     _channelId = null;
-    _channelName = null;
     _socketClient = null;
     _session = null;
     _userId = null;
     _username = null;
     _users.clear();
+
+    _logger.success('Disconnected from Nakama');
   }
 
   /// Dispose resources
