@@ -1,0 +1,73 @@
+version: '3'
+services:
+  postgres:
+    command: postgres -c shared_preload_libraries=""
+    environment:
+      POSTGRES_DB: nakama
+      POSTGRES_PASSWORD: localdb
+      POSTGRES_USER: root
+    expose:
+      - "8080"
+      - "26257"
+      - "5432"
+    healthcheck:
+      test: ["CMD", "pg_isready", "-U", "root"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    image: cockroachdb/cockroach:latest
+    volumes:
+      - ./data:/cockroach/cockroach-data
+    ports:
+      - "8080:8080"
+      - "26257:26257"
+      - "5432:5432"
+  minio:
+    image: minio/minio:latest
+    command: server /data --console-address ":9001"
+    environment:
+      MINIO_ROOT_USER: minioadmin
+      MINIO_ROOT_PASSWORD: minioadmin
+    ports:
+      - "9000:9000"
+      - "9001:9001"
+    volumes:
+      - ./data/minio:/data
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9000/minio/health/live"]
+      interval: 30s
+      timeout: 20s
+      retries: 3
+  nakama:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    depends_on:
+      - postgres
+      - minio
+    environment:
+      NAKAMA_DATABASE_URL: "postgres://root:localdb@postgres:26257/nakama?sslmode=disable"
+      MINIO_ENDPOINT: "minio:9000"
+      MINIO_ACCESS_KEY: "minioadmin"
+      MINIO_SECRET_KEY: "minioadmin"
+      MINIO_USE_SSL: "false"
+      MINIO_BUCKET: "chat-images"
+    expose:
+      - "7349"
+      - "7350"
+      - "7351"
+    healthcheck:
+      test: ["CMD", "/nakama/nakama", "healthcheck"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    ports:
+      - "7349:7349"
+      - "7350:7350"
+      - "7351:7351"
+    restart: unless-stopped
+    volumes:
+      - ./data:/nakama/data
+      - ./local.yml:/nakama/local.yml
+
+

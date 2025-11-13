@@ -1,0 +1,24 @@
+name: nakama
+data_dir: "./data/"
+
+logger:
+  level: "DEBUG"
+  stdout: true
+
+database:
+  address:
+    - "./data/db.db"
+  ssl_mode: "disable"
+
+socket:
+  server_key: "defaultkey"
+  port: 7350
+  protocol: "http"
+
+console:
+  username: "admin"
+  password: "password"
+  signing_key: "defaultsigningkey"
+  read_only: false
+
+
