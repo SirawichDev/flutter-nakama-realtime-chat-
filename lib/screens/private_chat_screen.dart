@@ -234,8 +234,8 @@ class _PrivateChatScreenState extends State<PrivateChatScreen> {
       file.path,
       targetPath,
       quality: 80,
-      minWidth: 1200,
-      minHeight: 1200,
+      minWidth: 800,
+      minHeight: 800,
       format: CompressFormat.webp,
     );
 
