@@ -249,6 +249,7 @@ class _PrivateChatScreenState extends State<PrivateChatScreen> {
   }
 
   Future<void> _pickAndSendImage() async {
+    File? compressed;
     try {
       final image = await _pickImage();
       if (image == null) return;
@@ -257,7 +258,7 @@ class _PrivateChatScreenState extends State<PrivateChatScreen> {
       File fileToSend = originalFile;
 
       // Attempt compression
-      final File? compressed = await _compressImage(originalFile);
+      compressed = await _compressImage(originalFile);
 
       if (compressed != null) {
         fileToSend = compressed;
@@ -274,14 +275,14 @@ class _PrivateChatScreenState extends State<PrivateChatScreen> {
       } else {
         print('Image sent successfully!');
       }
-
-      if (compressed != null && await compressed.exists()) {
-        await compressed.delete();
-      }
     } catch (e, stackTrace) {
       print('Error picking/sending image: $e');
       print('Stack trace: $stackTrace');
       _showError('Error picking image: $e');
+    } finally {
+      if (compressed != null && await compressed.exists()) {
+        await compressed.delete();
+      }
     }
   }
 
