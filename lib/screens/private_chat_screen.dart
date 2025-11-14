@@ -274,6 +274,10 @@ class _PrivateChatScreenState extends State<PrivateChatScreen> {
       } else {
         print('Image sent successfully!');
       }
+
+      if (compressed != null && await compressed.exists()) {
+        await compressed.delete();
+      }
     } catch (e, stackTrace) {
       print('Error picking/sending image: $e');
       print('Stack trace: $stackTrace');
