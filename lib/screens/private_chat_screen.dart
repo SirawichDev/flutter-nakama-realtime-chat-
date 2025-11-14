@@ -1,6 +1,8 @@
 import 'package:flutter/material.dart';
+import 'package:flutter_image_compress/flutter_image_compress.dart';
 import 'package:image_picker/image_picker.dart';
 import 'package:nakama/src/api/proto/api/api.pb.dart' as api;
+import 'package:path_provider/path_provider.dart';
 import '../services/nakama_service.dart';
 import '../services/chat_storage_service.dart';
 import '../models/chat_message.dart';
@@ -201,29 +203,71 @@ class _PrivateChatScreenState extends State<PrivateChatScreen> {
     }
   }
 
+  Future<XFile?> _pickImage() async {
+    print('Picking image from gallery...');
+    final image = await _imagePicker.pickImage(
+      source: ImageSource.gallery,
+    );
+
+    if (image == null) {
+      print('No image selected');
+      return null;
+    }
+
+    print('Image selected: ${image.path}');
+    return image;
+  }
+
+  Future<File?> _compressImage(File file) async {
+    if (!await file.exists()) {
+      _showError('Image file not found');
+      return null;
+    }
+
+    final tempDir = await getTemporaryDirectory();
+    final targetPath =
+        '${tempDir.path}/${DateTime.now().millisecondsSinceEpoch}.webp';
+
+    print('Compressing image...');
+
+    final compressedXFile = await FlutterImageCompress.compressAndGetFile(
+      file.path,
+      targetPath,
+      quality: 80,
+      minWidth: 1200,
+      minHeight: 1200,
+      format: CompressFormat.webp,
+    );
+
+    if (compressedXFile == null) {
+      print('Image compression failed');
+      return null;
+    }
+
+    print('Image compressed to: ${compressedXFile.path}');
+    return File(compressedXFile.path);
+  }
+
   Future<void> _pickAndSendImage() async {
     try {
-      print('Picking image from gallery...');
-      final XFile? image = await _imagePicker.pickImage(
-        source: ImageSource.gallery,
-        imageQuality: 80,
-      );
+      final image = await _pickImage();
+      if (image == null) return;
 
-      if (image == null) {
-        print('No image selected');
-        return;
-      }
+      final File originalFile = File(image.path);
+      File fileToSend = originalFile;
 
-      print('Image selected: ${image.path}');
-      final imageFile = File(image.path);
+      // Attempt compression
+      final File? compressed = await _compressImage(originalFile);
 
-      if (!await imageFile.exists()) {
-        _showError('Image file not found');
-        return;
+      if (compressed != null) {
+        fileToSend = compressed;
+        print('Using compressed image.');
+      } else {
+        print('Compression failed — using original image.');
       }
 
       print('Sending image...');
-      final success = await _nakamaService.sendImageMessage(imageFile);
+      final success = await _nakamaService.sendImageMessage(fileToSend);
 
       if (!success) {
         _showError('Failed to send image. Check console logs for details.');
